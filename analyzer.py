@@ -30,7 +30,7 @@ class ResumeAnalyzer:
     - Build final result
     """
 
-    DEFAULT_MODEL = "llama-3.3-70b-versatile"
+    DEFAULT_MODEL = "mixtral-8x7b-32768"  # More reliable for JSON
 
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key or os.getenv("GROQ_API_KEY")
@@ -47,15 +47,31 @@ class ResumeAnalyzer:
             raise AnalyzerError(f"Could not initialize Groq client: {error}")
 
     # =====================================================
+    # Debug logging: write raw responses to a file
+    # =====================================================
+
+    def _log_raw_response(self, content: str, stage: str):
+        """Write the raw AI response to a file for debugging."""
+        log_dir = "debug_logs"
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, f"raw_{stage}.txt")
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(f"DEBUG: Raw response for {stage} saved to {log_path}")
+
+    # =====================================================
     # Ultra‑robust JSON extraction
     # =====================================================
 
-    def _extract_json(self, content: str) -> Dict[str, Any]:
+    def _extract_json(self, content: str, stage: str = "unknown") -> Dict[str, Any]:
         """
         Attempt to extract a valid JSON object from the raw content.
         Handles Markdown, extra text, malformed whitespace, missing braces,
         unquoted keys, trailing commas, quoted JSON strings, and even Python dicts.
         """
+        # Log the raw response for debugging
+        self._log_raw_response(content, stage)
+
         raw = content.strip()
 
         # 1. Remove Markdown code fences
@@ -114,7 +130,37 @@ class ResumeAnalyzer:
         except (SyntaxError, ValueError, TypeError):
             pass
 
-        # 7. If all fail, raise a detailed error with the FULL raw content
+        # 7. If we still fail, try to extract key‑value pairs manually
+        #    (e.g., "job_title": "xxx", "required_skills": [...] )
+        #    This is a last‑ditch effort.
+        try:
+            # Remove outer braces if present
+            stripped = raw
+            if stripped.startswith("{") and stripped.endswith("}"):
+                stripped = stripped[1:-1].strip()
+            # Split by commas not inside brackets
+            # We'll use a simple regex to capture pairs
+            pairs = re.findall(r'"([^"]+)"\s*:\s*([^,]+)', stripped)
+            if pairs:
+                result = {}
+                for key, value in pairs:
+                    # Try to parse value as JSON
+                    v = value.strip()
+                    try:
+                        result[key] = json.loads(v)
+                    except:
+                        # If it's a string without quotes, add them
+                        if not (v.startswith('"') and v.endswith('"')):
+                            v = '"' + v + '"'
+                        try:
+                            result[key] = json.loads(v)
+                        except:
+                            result[key] = v
+                return result
+        except Exception:
+            pass
+
+        # 8. If all fail, raise a detailed error with the FULL raw content
         raise AnalyzerError(
             f"Failed to parse JSON. Raw content (full):\n{content}\n"
             "The AI did not return a valid JSON object."
@@ -124,7 +170,7 @@ class ResumeAnalyzer:
     # Groq JSON Call
     # =====================================================
 
-    def _call_ai(self, prompt: str) -> Dict[str, Any]:
+    def _call_ai(self, prompt: str, stage: str = "unknown") -> Dict[str, Any]:
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -140,7 +186,6 @@ class ResumeAnalyzer:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
-                # response_format removed to avoid potential issues
             )
         except Exception as error:
             raise AnalyzerError(f"Groq API request failed: {error}")
@@ -149,10 +194,10 @@ class ResumeAnalyzer:
         if not content:
             raise AnalyzerError("Groq returned an empty response.")
 
-        return self._extract_json(content)
+        return self._extract_json(content, stage)
 
     # =====================================================
-    # Main Workflow (unchanged)
+    # Main Workflow
     # =====================================================
 
     def analyze(self, resume_text: str, job_description: str) -> Dict[str, Any]:
@@ -163,18 +208,18 @@ class ResumeAnalyzer:
 
         # Stage 1: Job Description Analysis
         job_prompt = JOB_ANALYSIS_PROMPT.format(job_description=job_description)
-        job_analysis = self._call_ai(job_prompt)
+        job_analysis = self._call_ai(job_prompt, stage="job")
 
         # Stage 2: Resume Analysis
         resume_prompt = RESUME_ANALYSIS_PROMPT.format(resume_text=resume_text)
-        resume_analysis = self._call_ai(resume_prompt)
+        resume_analysis = self._call_ai(resume_prompt, stage="resume")
 
         # Stage 3: Comparison
         comparison_prompt = COMPARISON_PROMPT.format(
             resume_profile=json.dumps(resume_analysis, ensure_ascii=False),
             job_requirements=json.dumps(job_analysis, ensure_ascii=False),
         )
-        comparison = self._call_ai(comparison_prompt)
+        comparison = self._call_ai(comparison_prompt, stage="comparison")
 
         # Stage 4: Recommendations
         recommendations_prompt = RECOMMENDATIONS_PROMPT.format(
@@ -182,7 +227,7 @@ class ResumeAnalyzer:
             job_requirements=json.dumps(job_analysis, ensure_ascii=False),
             comparison=json.dumps(comparison, ensure_ascii=False),
         )
-        recommendations = self._call_ai(recommendations_prompt)
+        recommendations = self._call_ai(recommendations_prompt, stage="recommendations")
 
         # Stage 5: Score
         score = self._calculate_score(job_analysis, resume_analysis, comparison)
