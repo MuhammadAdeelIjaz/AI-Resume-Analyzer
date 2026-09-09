@@ -47,73 +47,74 @@ class ResumeAnalyzer:
             raise AnalyzerError(f"Could not initialize Groq client: {error}")
 
     # =====================================================
-    # Robust JSON extraction
+    # Ultra‑robust JSON extraction
     # =====================================================
 
     def _extract_json(self, content: str) -> Dict[str, Any]:
         """
         Attempt to extract a valid JSON object from the raw content.
         Handles Markdown, extra text, malformed whitespace, missing braces,
-        unquoted keys, trailing commas, and even Python dict-like strings.
+        unquoted keys, trailing commas, quoted JSON strings, and even Python dicts.
         """
-        # 1. Remove Markdown code fences
-        cleaned = re.sub(r"^```(?:json)?\s*", "", content, flags=re.IGNORECASE)
-        cleaned = re.sub(r"\s*```$", "", cleaned)
-        cleaned = cleaned.strip()
+        raw = content.strip()
 
-        # 2. If the whole string is quoted (like '"..."'), unquote and strip again
-        if cleaned.startswith('"') and cleaned.endswith('"'):
-            cleaned = cleaned[1:-1].strip()
+        # 1. Remove Markdown code fences
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```$", "", raw)
+        raw = raw.strip()
+
+        if not raw:
+            raise AnalyzerError("Empty response from AI.")
+
+        # 2. If the whole string is quoted, unquote it
+        if raw.startswith('"') and raw.endswith('"'):
+            raw = raw[1:-1].strip()
 
         # 3. Try to find a JSON object between the first { and last }
-        start = cleaned.find("{")
-        end = cleaned.rfind("}") + 1
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
         if start != -1 and end > start:
-            json_str = cleaned[start:end]
+            json_str = raw[start:end]
             try:
                 return json.loads(json_str, strict=False)
             except json.JSONDecodeError:
                 pass  # fall through
 
-        # 4. If no braces found, wrap the entire cleaned string with braces
-        #    but first, strip any leading/trailing non-JSON characters
-        #    (like stray quotes, spaces, newlines)
+        # 4. If no braces, wrap the entire cleaned string with braces
+        #    but first strip any stray quotes, spaces, newlines
+        cleaned = re.sub(r'^[\s"\'`]+', '', raw)
+        cleaned = re.sub(r'[\s"\'`]+$', '', cleaned)
         wrapped = "{" + cleaned + "}"
         try:
             return json.loads(wrapped, strict=False)
         except json.JSONDecodeError:
             pass
 
-        # 5. Try to repair common JSON issues:
-        #    - Remove trailing commas
-        #    - Add missing quotes around keys
+        # 5. Repair common JSON issues:
+        #    - Remove trailing commas before } or ]
+        #    - Quote unquoted keys (alphanumeric and underscore)
         #    - Replace single quotes with double quotes
         repaired = cleaned
-        # Remove trailing commas before } or ]
-        repaired = re.sub(r",\s*([}\]])", r"\1", repaired)
-        # Add quotes to unquoted keys (simple alphanumeric and underscore)
-        repaired = re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', repaired)
-        # Replace single quotes with double quotes (but careful with nested quotes)
-        # This is a simple approach; might be improved
-        repaired = repaired.replace("'", '"')
-        # Try to parse again
+        repaired = re.sub(r',\s*([}\]])', r'\1', repaired)  # trailing commas
+        repaired = re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', repaired)  # keys
+        repaired = repaired.replace("'", '"')  # single quotes
+        wrapped = "{" + repaired + "}"
         try:
-            return json.loads(repaired, strict=False)
+            return json.loads(wrapped, strict=False)
         except json.JSONDecodeError:
             pass
 
         # 6. Last resort: use ast.literal_eval if it looks like a Python dict
         try:
-            # Remove trailing commas and convert to Python dict literal
+            # Remove trailing commas and extra whitespace
             if cleaned.strip().startswith("{") and cleaned.strip().endswith("}"):
-                # Use ast.literal_eval which is safer than eval
                 result = ast.literal_eval(cleaned)
                 if isinstance(result, dict):
                     return result
         except (SyntaxError, ValueError, TypeError):
             pass
 
-        # 7. If all fail, raise a detailed error with the full raw content
+        # 7. If all fail, raise a detailed error with the FULL raw content
         raise AnalyzerError(
             f"Failed to parse JSON. Raw content (full):\n{content}\n"
             "The AI did not return a valid JSON object."
@@ -139,7 +140,7 @@ class ResumeAnalyzer:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.1,
-                response_format={"type": "json_object"},
+                # response_format removed to avoid potential issues
             )
         except Exception as error:
             raise AnalyzerError(f"Groq API request failed: {error}")
