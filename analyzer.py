@@ -30,7 +30,7 @@ class ResumeAnalyzer:
     - Build final result
     """
 
-    DEFAULT_MODEL = "mixtral-8x7b-32768"  # More reliable for JSON
+    DEFAULT_MODEL = "mixtral-8x7b-32768"
 
     def __init__(self, api_key: str | None = None):
         self.api_key = api_key or os.getenv("GROQ_API_KEY")
@@ -47,34 +47,17 @@ class ResumeAnalyzer:
             raise AnalyzerError(f"Could not initialize Groq client: {error}")
 
     # =====================================================
-    # Debug logging: write raw responses to a file
-    # =====================================================
-
-    def _log_raw_response(self, content: str, stage: str):
-        """Write the raw AI response to a file for debugging."""
-        log_dir = "debug_logs"
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, f"raw_{stage}.txt")
-        with open(log_path, "w", encoding="utf-8") as f:
-            f.write(content)
-        print(f"DEBUG: Raw response for {stage} saved to {log_path}")
-
-    # =====================================================
     # Ultra‑robust JSON extraction
     # =====================================================
 
-    def _extract_json(self, content: str, stage: str = "unknown") -> Dict[str, Any]:
+    def _extract_json(self, content: str) -> Dict[str, Any]:
         """
         Attempt to extract a valid JSON object from the raw content.
-        Handles Markdown, extra text, malformed whitespace, missing braces,
-        unquoted keys, trailing commas, quoted JSON strings, and even Python dicts.
+        Tries multiple strategies in order.
         """
-        # Log the raw response for debugging
-        self._log_raw_response(content, stage)
-
         raw = content.strip()
 
-        # 1. Remove Markdown code fences
+        # Remove Markdown code fences
         raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
         raw = re.sub(r"\s*```$", "", raw)
         raw = raw.strip()
@@ -82,47 +65,57 @@ class ResumeAnalyzer:
         if not raw:
             raise AnalyzerError("Empty response from AI.")
 
-        # 2. If the whole string is quoted, unquote it
-        if raw.startswith('"') and raw.endswith('"'):
-            raw = raw[1:-1].strip()
+        # Helper to try parsing
+        def try_parse(s):
+            try:
+                return json.loads(s, strict=False)
+            except:
+                return None
 
-        # 3. Try to find a JSON object between the first { and last }
+        # ----- 1. Direct parse -----
+        result = try_parse(raw)
+        if result is not None:
+            return result
+
+        # ----- 2. If whole string is quoted, unquote and try -----
+        if raw.startswith('"') and raw.endswith('"'):
+            unquoted = raw[1:-1].strip()
+            result = try_parse(unquoted)
+            if result is not None:
+                return result
+
+        # ----- 3. Extract between first { and last } -----
         start = raw.find("{")
         end = raw.rfind("}") + 1
         if start != -1 and end > start:
             json_str = raw[start:end]
-            try:
-                return json.loads(json_str, strict=False)
-            except json.JSONDecodeError:
-                pass  # fall through
+            result = try_parse(json_str)
+            if result is not None:
+                return result
 
-        # 4. If no braces, wrap the entire cleaned string with braces
-        #    but first strip any stray quotes, spaces, newlines
+        # ----- 4. Strip leading/trailing junk and wrap with braces -----
         cleaned = re.sub(r'^[\s"\'`]+', '', raw)
         cleaned = re.sub(r'[\s"\'`]+$', '', cleaned)
         wrapped = "{" + cleaned + "}"
-        try:
-            return json.loads(wrapped, strict=False)
-        except json.JSONDecodeError:
-            pass
+        result = try_parse(wrapped)
+        if result is not None:
+            return result
 
-        # 5. Repair common JSON issues:
-        #    - Remove trailing commas before } or ]
-        #    - Quote unquoted keys (alphanumeric and underscore)
-        #    - Replace single quotes with double quotes
+        # ----- 5. Repair common issues: trailing commas, unquoted keys, single quotes -----
         repaired = cleaned
-        repaired = re.sub(r',\s*([}\]])', r'\1', repaired)  # trailing commas
-        repaired = re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', repaired)  # keys
-        repaired = repaired.replace("'", '"')  # single quotes
+        # Remove trailing commas before } or ]
+        repaired = re.sub(r',\s*([}\]])', r'\1', repaired)
+        # Quote unquoted keys
+        repaired = re.sub(r'([{,])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r'\1"\2":', repaired)
+        # Replace single quotes with double quotes
+        repaired = repaired.replace("'", '"')
         wrapped = "{" + repaired + "}"
-        try:
-            return json.loads(wrapped, strict=False)
-        except json.JSONDecodeError:
-            pass
+        result = try_parse(wrapped)
+        if result is not None:
+            return result
 
-        # 6. Last resort: use ast.literal_eval if it looks like a Python dict
+        # ----- 6. Use ast.literal_eval if it looks like a Python dict -----
         try:
-            # Remove trailing commas and extra whitespace
             if cleaned.strip().startswith("{") and cleaned.strip().endswith("}"):
                 result = ast.literal_eval(cleaned)
                 if isinstance(result, dict):
@@ -130,37 +123,33 @@ class ResumeAnalyzer:
         except (SyntaxError, ValueError, TypeError):
             pass
 
-        # 7. If we still fail, try to extract key‑value pairs manually
-        #    (e.g., "job_title": "xxx", "required_skills": [...] )
-        #    This is a last‑ditch effort.
+        # ----- 7. Manually extract key-value pairs (even without braces) -----
         try:
-            # Remove outer braces if present
-            stripped = raw
-            if stripped.startswith("{") and stripped.endswith("}"):
-                stripped = stripped[1:-1].strip()
-            # Split by commas not inside brackets
-            # We'll use a simple regex to capture pairs
-            pairs = re.findall(r'"([^"]+)"\s*:\s*([^,]+)', stripped)
-            if pairs:
-                result = {}
-                for key, value in pairs:
-                    # Try to parse value as JSON
+            # Find all patterns like "key": value (value may be string, number, array, object)
+            # We'll capture until a comma or end, but handle nested structures poorly.
+            # Better: use regex that matches keys and values, but we'll do a simple version.
+            # Since the error shows "job_title", we can try to parse a simple object.
+            # We'll attempt to find all quoted keys and their values.
+            pattern = r'"([^"]+)"\s*:\s*([^,]+)(?=,|$)'
+            matches = re.findall(pattern, raw)
+            if matches:
+                result_dict = {}
+                for key, value in matches:
                     v = value.strip()
-                    try:
-                        result[key] = json.loads(v)
-                    except:
+                    parsed = try_parse(v)
+                    if parsed is None:
                         # If it's a string without quotes, add them
                         if not (v.startswith('"') and v.endswith('"')):
                             v = '"' + v + '"'
-                        try:
-                            result[key] = json.loads(v)
-                        except:
-                            result[key] = v
-                return result
+                        parsed = try_parse(v)
+                    if parsed is None:
+                        parsed = v
+                    result_dict[key] = parsed
+                return result_dict
         except Exception:
             pass
 
-        # 8. If all fail, raise a detailed error with the FULL raw content
+        # ----- 8. All failed: raise error with full content -----
         raise AnalyzerError(
             f"Failed to parse JSON. Raw content (full):\n{content}\n"
             "The AI did not return a valid JSON object."
@@ -170,7 +159,7 @@ class ResumeAnalyzer:
     # Groq JSON Call
     # =====================================================
 
-    def _call_ai(self, prompt: str, stage: str = "unknown") -> Dict[str, Any]:
+    def _call_ai(self, prompt: str) -> Dict[str, Any]:
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -194,10 +183,10 @@ class ResumeAnalyzer:
         if not content:
             raise AnalyzerError("Groq returned an empty response.")
 
-        return self._extract_json(content, stage)
+        return self._extract_json(content)
 
     # =====================================================
-    # Main Workflow
+    # Main Workflow (unchanged)
     # =====================================================
 
     def analyze(self, resume_text: str, job_description: str) -> Dict[str, Any]:
@@ -208,18 +197,18 @@ class ResumeAnalyzer:
 
         # Stage 1: Job Description Analysis
         job_prompt = JOB_ANALYSIS_PROMPT.format(job_description=job_description)
-        job_analysis = self._call_ai(job_prompt, stage="job")
+        job_analysis = self._call_ai(job_prompt)
 
         # Stage 2: Resume Analysis
         resume_prompt = RESUME_ANALYSIS_PROMPT.format(resume_text=resume_text)
-        resume_analysis = self._call_ai(resume_prompt, stage="resume")
+        resume_analysis = self._call_ai(resume_prompt)
 
         # Stage 3: Comparison
         comparison_prompt = COMPARISON_PROMPT.format(
             resume_profile=json.dumps(resume_analysis, ensure_ascii=False),
             job_requirements=json.dumps(job_analysis, ensure_ascii=False),
         )
-        comparison = self._call_ai(comparison_prompt, stage="comparison")
+        comparison = self._call_ai(comparison_prompt)
 
         # Stage 4: Recommendations
         recommendations_prompt = RECOMMENDATIONS_PROMPT.format(
@@ -227,7 +216,7 @@ class ResumeAnalyzer:
             job_requirements=json.dumps(job_analysis, ensure_ascii=False),
             comparison=json.dumps(comparison, ensure_ascii=False),
         )
-        recommendations = self._call_ai(recommendations_prompt, stage="recommendations")
+        recommendations = self._call_ai(recommendations_prompt)
 
         # Stage 5: Score
         score = self._calculate_score(job_analysis, resume_analysis, comparison)
