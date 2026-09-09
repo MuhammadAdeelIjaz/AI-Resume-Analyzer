@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Any, Dict
 
 from groq import Groq
@@ -62,6 +63,43 @@ class ResumeAnalyzer:
             )
 
     # =====================================================
+    # Helper: Extract JSON from possibly messy response
+    # =====================================================
+
+    def _extract_json(self, content: str) -> Dict[str, Any]:
+        """
+        Attempt to extract a valid JSON object from the raw content.
+        Handles Markdown, extra text, and malformed whitespace.
+        """
+        # Remove leading/trailing whitespace
+        cleaned = content.strip()
+
+        # Remove Markdown code fences (```json ... ```)
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+
+        # Try to find a JSON object between the first { and last }
+        start = cleaned.find("{")
+        end = cleaned.rfind("}") + 1
+
+        if start != -1 and end > start:
+            json_str = cleaned[start:end]
+            try:
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                # Fall through to try the whole string
+                pass
+
+        # If that fails, try parsing the whole cleaned string
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as e:
+            # Provide detailed error including raw content for debugging
+            raise AnalyzerError(
+                f"Failed to parse JSON. Raw content (first 500 chars):\n{cleaned[:500]}\nError: {e}"
+            )
+
+    # =====================================================
     # Groq JSON Call
     # =====================================================
 
@@ -116,15 +154,8 @@ class ResumeAnalyzer:
                 "Groq returned an empty response."
             )
 
-        try:
-
-            return json.loads(content)
-
-        except json.JSONDecodeError:
-
-            raise AnalyzerError(
-                "Groq returned invalid JSON."
-            )
+        # Use the robust extraction method
+        return self._extract_json(content)
 
     # =====================================================
     # Main Workflow
