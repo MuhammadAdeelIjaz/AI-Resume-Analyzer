@@ -69,35 +69,55 @@ class ResumeAnalyzer:
     def _extract_json(self, content: str) -> Dict[str, Any]:
         """
         Attempt to extract a valid JSON object from the raw content.
-        Handles Markdown, extra text, and malformed whitespace.
+        Handles Markdown, extra text, malformed whitespace, and missing braces.
         """
-        # Remove leading/trailing whitespace
-        cleaned = content.strip()
-
         # Remove Markdown code fences (```json ... ```)
-        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"^```(?:json)?\s*", "", content, flags=re.IGNORECASE)
         cleaned = re.sub(r"\s*```$", "", cleaned)
+        cleaned = cleaned.strip()
 
-        # Try to find a JSON object between the first { and last }
+        # ---- Try 1: direct parse ----
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            pass
+
+        # ---- Try 2: extract between first { and last } ----
         start = cleaned.find("{")
         end = cleaned.rfind("}") + 1
-
         if start != -1 and end > start:
             json_str = cleaned[start:end]
             try:
                 return json.loads(json_str)
             except json.JSONDecodeError:
-                # Fall through to try the whole string
                 pass
 
-        # If that fails, try parsing the whole cleaned string
-        try:
-            return json.loads(cleaned)
-        except json.JSONDecodeError as e:
-            # Provide detailed error including raw content for debugging
-            raise AnalyzerError(
-                f"Failed to parse JSON. Raw content (first 500 chars):\n{cleaned[:500]}\nError: {e}"
-            )
+        # ---- Try 3: wrap the entire string in braces (if no braces found or malformed) ----
+        # If the string doesn't start with { and end with }, add them.
+        if not (cleaned.startswith("{") and cleaned.endswith("}")):
+            # Also remove any leading/trailing quotes that might wrap the whole object
+            if cleaned.startswith('"') and cleaned.endswith('"'):
+                cleaned = cleaned[1:-1]
+            wrapped = "{" + cleaned + "}"
+            try:
+                return json.loads(wrapped)
+            except json.JSONDecodeError:
+                pass
+
+        # ---- Try 4: if it's a quoted JSON string, unquote and try again ----
+        if cleaned.startswith('"') and cleaned.endswith('"'):
+            # Remove outer quotes and try parsing again (maybe it's a JSON string)
+            inner = cleaned[1:-1]
+            try:
+                return json.loads(inner)
+            except json.JSONDecodeError:
+                pass
+
+        # ---- If all fail, raise a detailed error ----
+        raise AnalyzerError(
+            f"Failed to parse JSON. Raw content (first 500 chars):\n{cleaned[:500]}\n"
+            "The AI did not return a valid JSON object."
+        )
 
     # =====================================================
     # Groq JSON Call
